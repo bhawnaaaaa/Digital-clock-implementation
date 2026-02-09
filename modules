@@ -1,0 +1,516 @@
+`timescale 1ns / 1ps
+
+module clk_divider (
+    input wire clk_in,        // 100 MHz clock from Artix-7
+    input wire reset,
+    output reg clk_100hz_count, // 100 Hz clock for counter update
+    output reg clk_mux_10khz  // 10 kHz clock for debouncing & display MUX
+);
+
+    // 100MHz / 100Hz / 2 = 500,000. Counter runs up to 499,999.
+    localparam CNT_100HZ_MAX = 500000 - 1; 
+    
+    // 100MHz / 10kHz / 2 = 5,000. Counter runs up to 4,999.
+    localparam CNT_10KHZ_MAX = 5000 - 1; 
+
+    reg [26:0] counter_100hz_count = 0;
+    reg [13:0] counter_10khz = 0; 
+
+    // 100 Hz Clock Generator (Reset clears the clock state)
+    always @(posedge clk_in or posedge reset) begin
+        if (reset) begin
+            counter_100hz_count <= 0;
+            clk_100hz_count <= 0;
+        end else begin
+            if (counter_100hz_count == CNT_100HZ_MAX) begin
+                counter_100hz_count <= 0;
+                clk_100hz_count <= ~clk_100hz_count;
+            end else begin
+                counter_100hz_count <= counter_100hz_count + 1;
+            end
+        end
+    end
+
+    // 10 kHz MUX Clock Generator (Reset clears the clock state)
+    always @(posedge clk_in or posedge reset) begin
+        if (reset) begin
+            counter_10khz <= 0;
+            clk_mux_10khz <= 0;
+        end else begin
+            if (counter_10khz == CNT_10KHZ_MAX) begin
+                counter_10khz <= 0;
+                clk_mux_10khz <= ~clk_mux_10khz;
+            end else begin
+                counter_10khz <= counter_10khz + 1;
+            end
+        end
+    end
+
+endmodule
+
+
+module debouncer (
+    input wire clk_10khz, 
+    input wire button_in,
+    output reg button_out // Clean, synchronized, and HELD-HIGH signal (Level)
+);
+
+    reg [2:0] shift_reg = 0; 
+
+    always @(posedge clk_10khz) begin
+        // Simple shift register for button debouncing and synchronization
+        shift_reg <= {shift_reg[1:0], button_in};
+        button_out <= shift_reg[2];
+    end
+
+endmodule
+
+
+module stopwatch_timer_core (
+    input wire clk_100hz_count, 
+    input wire reset, // Master reset (driven by RSTN | BTN_RST)
+    input wire mode_btn_p,     
+    input wire start_stop_btn_p, 
+    input wire set_btn_p,     
+    input wire lap_btn_p,    
+    input wire [5:0] switches, 
+
+    output wire [5:0] mins_o,
+    output wire [5:0] secs_o,
+    output wire [4:0] lap_count_o, 
+    output wire is_timer_mode_o,
+    output wire blink_on_o,
+    output wire run_status_o,
+    output wire led_flash_active_o
+);
+
+    // =======================================================
+    // ** EDGE DETECTION LOGIC **
+    // =======================================================
+    reg mode_btn_d1 = 0;
+    reg start_stop_btn_d1 = 0;
+    reg set_btn_d1 = 0;
+    reg lap_btn_d1 = 0;
+
+    wire mode_btn_edge = mode_btn_p & (~mode_btn_d1);
+    wire start_stop_btn_edge = start_stop_btn_p & (~start_stop_btn_d1);
+    wire set_btn_edge = set_btn_p & (~set_btn_d1);
+    wire lap_btn_edge = lap_btn_p & (~lap_btn_d1);
+
+    always @(posedge clk_100hz_count) begin
+        mode_btn_d1 <= mode_btn_p;
+        start_stop_btn_d1 <= start_stop_btn_p;
+        set_btn_d1 <= set_btn_p;
+        lap_btn_d1 <= lap_btn_p;
+    end
+    // =======================================================
+
+    // Internal Sequential Registers (Actual Flip-Flops)
+    reg [5:0] minutes = 0;
+    reg [5:0] seconds = 0;
+    reg [6:0] hundredths = 0; 
+    // 5 bits for 16 laps (0-15)
+    reg [4:0] lap_count = 0; 
+    reg mode_reg = 0;      // 0: Stopwatch (Default/First State), 1: Timer
+    reg run_reg = 0;       // 0: Stopped (Default/First State), 1: Running
+    reg [1:0] set_phase_reg = 0; // 0: Idle (Default/First State), 1: Set Mins, 2: Set Secs
+    reg timer_done_blinking = 0;
+    reg [2:0] blink_counter = 0; 
+    reg led_flash_active = 0;
+    reg [8:0] flash_counter = 0; 
+    
+    // Combinatorial Next-State REGISTERS (Used in always @(*))
+    reg [5:0] minutes_next;    
+    reg [5:0] seconds_next;    
+    reg [6:0] hundredths_next; 
+
+    // Output Assignments
+    assign mins_o = minutes;
+    assign secs_o = seconds;
+    assign lap_count_o = lap_count;
+    assign is_timer_mode_o = mode_reg;
+    assign run_status_o = run_reg; 
+    assign blink_on_o = timer_done_blinking && (blink_counter[0] == 1'b0); 
+    assign led_flash_active_o = led_flash_active; 
+
+    // --- Mode Control Logic (Sequential) ---
+    always @(posedge clk_100hz_count or posedge reset) begin
+        if (reset) begin 
+            // **RESET TO FIRST STATE**: Stopwatch Mode (0) and exit setting phase (0).
+            mode_reg <= 0;
+            set_phase_reg <= 0;
+        end else begin
+            if (mode_btn_edge && run_reg == 0 && set_phase_reg == 0 && timer_done_blinking == 0) begin
+                mode_reg <= ~mode_reg;
+            end
+
+            if (mode_reg == 1 && run_reg == 0) begin
+                if (set_btn_edge) begin 
+                    case (set_phase_reg)
+                        2'b00: set_phase_reg <= 2'b01; 
+                        2'b01: set_phase_reg <= 2'b10; 
+                        2'b10: set_phase_reg <= 2'b00; 
+                        default: set_phase_reg <= 2'b00;
+                    endcase
+                end
+            end else if (mode_reg == 0) begin 
+                set_phase_reg <= 0;
+            end
+        end
+    end
+
+    // --- Run State Logic (Sequential) ---
+    always @(posedge clk_100hz_count or posedge reset) begin
+        if (reset) begin 
+            // **RESET TO FIRST STATE**: Set to Stopped (0) and clear status flags
+            run_reg <= 0;
+            timer_done_blinking <= 0;
+            blink_counter <= 0;
+            led_flash_active <= 0;
+            flash_counter <= 0;
+        end
+        
+        else if (led_flash_active) begin
+            run_reg <= 0;
+            timer_done_blinking <= 0; 
+            blink_counter <= 0;
+            
+            if (flash_counter == 50 - 1) begin 
+                led_flash_active <= 0; 
+                flash_counter <= 0;
+            end else begin
+                led_flash_active <= 1;
+                flash_counter <= flash_counter + 1;
+            end
+        end
+        
+        
+        else if (timer_done_blinking) begin
+            run_reg <= 0;
+            led_flash_active <= 0;
+            flash_counter <= 0;
+            
+            if (blink_counter == 6) begin 
+                timer_done_blinking <= 0; 
+                blink_counter <= 0;
+            end else begin
+                timer_done_blinking <= 1; 
+                blink_counter <= blink_counter + 1;
+            end
+        end 
+        
+        else if (mode_reg == 1 && run_reg == 1 && minutes == 0 && seconds == 0 && hundredths == 1) begin
+            run_reg <= 0;
+            timer_done_blinking <= 1; 
+            led_flash_active <= 1; 
+            blink_counter <= 0;
+            flash_counter <= 0;
+        end 
+        
+        else if (start_stop_btn_edge && set_phase_reg == 0) begin 
+            run_reg <= ~run_reg;
+            timer_done_blinking <= 0;
+            led_flash_active <= 0;
+            blink_counter <= 0;
+            flash_counter <= 0;
+        end 
+        
+        else if (mode_btn_edge || set_btn_edge || lap_btn_edge) begin
+            timer_done_blinking <= 0;
+            led_flash_active <= 0;
+            blink_counter <= 0;
+            flash_counter <= 0;
+            run_reg <= run_reg;
+        end
+    end
+
+    // ====================================================================
+    // *** COMBINATORIAL NEXT-STATE LOGIC (Determines M/S/H next values) ***
+    // ====================================================================
+    always @(*) begin
+        // Default (Hold current state)
+        minutes_next = minutes;
+        seconds_next = seconds;
+        hundredths_next = hundredths;
+        
+        // The combinatorial logic here is responsible for calculating the NEXT state
+        if ((mode_btn_edge && run_reg == 0 && set_phase_reg == 0)) begin 
+            minutes_next = minutes;
+            seconds_next = seconds;
+            hundredths_next = hundredths; 
+        end 
+        
+        // PRIORITY 2: Setting logic
+        else if (set_phase_reg != 0) begin 
+            if (set_phase_reg == 2'b01) begin // Set Minutes
+                minutes_next = switches;
+                seconds_next = seconds;
+                hundredths_next = 0;
+            end else begin // Set Seconds (set_phase_reg == 2'b10)
+                minutes_next = minutes;
+                seconds_next = switches;
+                hundredths_next = 0;
+            end
+        end 
+        
+        // PRIORITY 3: Main counting logic
+        else if (run_reg == 1) begin 
+            if (mode_reg == 0) begin // *STOPWATCH MODE: Count Up (100Hz)*
+                if (hundredths == 99) begin
+                    hundredths_next = 0;
+                    if (seconds == 59) begin
+                        seconds_next = 0;
+                        if (minutes == 59) begin
+                            minutes_next = 0; 
+                        end else begin
+                            minutes_next = minutes + 1;
+                        end
+                    end else begin
+                        seconds_next = seconds + 1;
+                        minutes_next = minutes; 
+                    end
+                end else begin
+                    hundredths_next = hundredths + 1;
+                    seconds_next = seconds; 
+                    minutes_next = minutes; 
+                end
+            end else begin // *TIMER MODE: Count Down (100Hz)*
+                if (hundredths == 0) begin
+                    if (seconds == 0) begin
+                        if (minutes == 0) begin
+                            hundredths_next = 0; 
+                            seconds_next = 0;
+                            minutes_next = 0;
+                        end else begin
+                            hundredths_next = 99;
+                            seconds_next = 59;
+                            minutes_next = minutes - 1;
+                        end
+                    end else begin
+                        hundredths_next = 99;
+                        seconds_next = seconds - 1;
+                        minutes_next = minutes; 
+                    end
+                end else begin
+                    hundredths_next = hundredths - 1;
+                    seconds_next = seconds; 
+                    minutes_next = minutes; 
+                end
+            end
+        end
+        
+        // PRIORITY 4: Timer Stopped/Idle (Handled by initial default)
+    end
+    
+    // ====================================================================
+    // *** SEQUENTIAL UPDATE BLOCK (Time Registers) ***
+    // ====================================================================
+    // *Reset here clears time*
+    always @(posedge clk_100hz_count or posedge reset) begin 
+        // If reset is high (button pressed), time registers are cleared unconditionally
+        if (reset) begin 
+            minutes <= 0;
+            seconds <= 0;
+            hundredths <= 0;
+        end else begin
+            minutes <= minutes_next;
+            seconds <= seconds_next;
+            hundredths <= hundredths_next;
+        end
+    end
+    
+    // --- Lap Counter Logic (Independent Sequential Block) ---
+    always @(posedge clk_100hz_count or posedge reset) begin
+        // **RESET TO FIRST STATE**: Lap count cleared immediately by 'reset' to 0.
+        if (reset) begin 
+            lap_count <= 0;
+        end else if (mode_reg == 0 && lap_btn_edge) begin 
+            // Rollover from 15 (16th lap count) to 1.
+            if (lap_count == 5'd15) begin 
+                lap_count <= 1; 
+            end else begin
+                lap_count <= lap_count + 1;
+            end
+        end
+    end
+
+endmodule
+
+module top_module (
+    input wire CLK100MHZ,      
+    input wire RSTN,           // CPU Reset (Active Low)
+    
+    // Push Buttons
+    input wire BTN_MODE,       
+    input wire BTN_START_STOP, 
+    input wire BTN_SET,        
+    input wire BTN_LAP,        
+    input wire BTN_RST,        // Dedicated Manual Reset Button
+
+    // DIP Switches
+    input wire [5:0] SW,
+
+    output reg [5:0] an,       
+    output reg [6:0] seg,
+    output wire DP,            // Decimal Point/Colon Output (Must be constrained in XDC)
+
+    // LEDs (Lap Count)
+    output wire [15:0] LED     // EXPANDED TO 16 BITS
+);
+
+    // Internal Wires 
+    wire clk_100hz_count; 
+    wire clk_mux_10khz; 
+    wire reset_internal; // This is the final, active-high reset signal
+
+    // Debounced button signals
+    wire mode_btn_p, start_stop_btn_p, set_btn_p, lap_btn_p, rst_btn_p; 
+    
+    // Core Signals
+    wire [5:0] mins_w, secs_w;
+    // 5 bits for 16 laps
+    wire [4:0] lap_count_w; 
+    wire is_timer_mode_w;
+    wire blink_on_w; 
+    wire run_status_w;
+    wire led_flash_active_w; 
+    wire clk_display_rst;
+
+    // --- COMBINED RESET LOGIC: This is the reset button logic ---
+    // The internal reset is active-high if RSTN is low OR BTN_RST is pressed (active high)
+    assign clk_display_rst= ~RSTN;
+    assign reset_internal = clk_display_rst | rst_btn_p; 
+
+    // -----------------------------------------------------------------
+    // 1. CLOCK DIVIDER INSTANTIATION
+    // -----------------------------------------------------------------
+    clk_divider U_CLK_DIV (
+        .clk_in(CLK100MHZ),
+        .reset(clk_display_rst),
+        .clk_100hz_count(clk_100hz_count),
+        .clk_mux_10khz(clk_mux_10khz)
+    );
+
+    // -----------------------------------------------------------------
+    // 2. DEBOUNCER INSTANTIATIONS (BTN_RST is debounced to rst_btn_p)
+    // -----------------------------------------------------------------
+    debouncer U_DEBOUNCE_MODE ( .clk_10khz(clk_mux_10khz), .button_in(BTN_MODE), .button_out(mode_btn_p) );
+    debouncer U_DEBOUNCE_SS ( .clk_10khz(clk_mux_10khz), .button_in(BTN_START_STOP), .button_out(start_stop_btn_p) );
+    debouncer U_DEBOUNCE_SET ( .clk_10khz(clk_mux_10khz), .button_in(BTN_SET), .button_out(set_btn_p) );
+    debouncer U_DEBOUNCE_LAP ( .clk_10khz(clk_mux_10khz), .button_in(BTN_LAP), .button_out(lap_btn_p) );
+    debouncer U_DEBOUNCE_RST ( .clk_10khz(clk_mux_10khz), .button_in(BTN_RST), .button_out(rst_btn_p) );
+
+    // -----------------------------------------------------------------
+    // 3. CORE LOGIC INSTANTIATION
+    // -----------------------------------------------------------------
+    stopwatch_timer_core U_CORE (
+        .clk_100hz_count(clk_100hz_count),
+        .reset(reset_internal), // Passes the combined reset signal to the core
+        .mode_btn_p(mode_btn_p), 
+        .start_stop_btn_p(start_stop_btn_p),
+        .set_btn_p(set_btn_p),
+        .lap_btn_p(lap_btn_p),
+        .switches(SW),
+        .mins_o(mins_w),
+        .secs_o(secs_w),
+        .lap_count_o(lap_count_w),
+        .is_timer_mode_o(is_timer_mode_w),
+        .blink_on_o(blink_on_w),
+        .run_status_o(run_status_w),
+        .led_flash_active_o(led_flash_active_w)
+    );
+
+    // --- DP/COLON LOGIC (Active Low) ---
+    assign DP = ~(~clk_mux_10khz | blink_on_w); 
+
+    // --- LED Output for Lap Count (Tally Count Logic, overridden by led_flash_active_w) ---
+    assign LED = (led_flash_active_w == 1'b1) ? 16'hFFFF : // PRIORITY 1: Timer Done (ALL 16 LEDs ON for 0.5s)
+                  // Check lap_count_w (5 bits, 0-15) and shift/mask accordingly.
+                  (lap_count_w == 5'd0) ? 16'h0000 : // Lap 0 is OFF
+                  (16'd1 << lap_count_w) - 1;
+
+
+    // --- 7-Segment Decoder Function ---
+    function [6:0] seven_seg_decoder;
+        input [3:0] data; 
+        case (data)
+            4'd0: seven_seg_decoder = 7'b1000000; 4'd1: seven_seg_decoder = 7'b1111001;
+            4'd2: seven_seg_decoder = 7'b0100100; 4'd3: seven_seg_decoder = 7'b0110000;
+            4'd4: seven_seg_decoder = 7'b0011001; 4'd5: seven_seg_decoder = 7'b0010010;
+            4'd6: seven_seg_decoder = 7'b0000010; 4'd7: seven_seg_decoder = 7'b1111000;
+            4'd8: seven_seg_decoder = 7'b0000000; 4'd9: seven_seg_decoder = 7'b0010000;
+            default: seven_seg_decoder = 7'b1111111; 
+        endcase
+    endfunction
+    localparam S_CHAR = 7'b0010010; 
+    localparam T_CHAR = 7'b0000111; 
+
+    // --- Display Multiplexer Logic ---
+    reg [2:0] digit_select = 0; 
+    reg [3:0] run_status_display; 
+
+    always @(*) begin
+        run_status_display = run_status_w ? 4'd1 : 4'd0; 
+    end
+
+    // Reset here is also asynchronous to ensure display blanking on button press
+    always @(posedge clk_mux_10khz or posedge clk_display_rst) begin 
+        if (clk_display_rst) begin
+            digit_select <= 1;
+        end else begin
+            digit_select <= digit_select + 1;
+        end
+    end
+
+    always @(*) begin
+        an = 6'b111111; // Default OFF
+        seg = 7'b1111111; // Default OFF
+        
+        
+        if (blink_on_w == 1'b1) begin 
+            an = 6'b000000; 
+            seg = 7'b1111111; 
+        end else begin
+            case (digit_select)
+                
+                // LEFT-TO-RIGHT TIME DISPLAY (AN3 -> AN0)
+                3'd0: begin // AN3: Minutes High Digit 
+                    an = 6'b110111; 
+                    seg = seven_seg_decoder(mins_w / 10);
+                end
+                3'd1: begin // AN2: Minutes Low Digit
+                    an = 6'b111011; 
+                    seg = seven_seg_decoder(mins_w % 10);
+                end
+                3'd2: begin // AN1: Seconds High Digit
+                    an = 6'b111101; 
+                    seg = seven_seg_decoder(secs_w / 10);
+                end
+                3'd3: begin // AN0: Seconds Low Digit 
+                    an = 6'b111110; 
+                    seg = seven_seg_decoder(secs_w % 10);
+                end
+                
+                // AN5 and AN4 for status/mode
+                3'd4: begin // AN5: Run Status (0 or 1)
+                    an = 6'b011111; 
+                    seg = seven_seg_decoder(run_status_display); 
+                end
+                3'd5: begin // AN4: Mode Status ('t' or 's')
+                    an = 6'b101111; 
+                    if (is_timer_mode_w == 1) begin
+                        seg = T_CHAR; 
+                    end else begin
+                        seg = S_CHAR; 
+                    end
+                end
+                
+                default: begin
+                    an = 6'b111111;
+                    seg = 7'b1111111;
+                end
+            endcase
+        end
+    end
+   
+endmodule
